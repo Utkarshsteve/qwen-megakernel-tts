@@ -96,8 +96,17 @@ The code predictor is ~65% of decode: **15 sequential forwards/frame of a tiny 5
 
 **Findings (honest):**
 - Dropping the per-frame `output_hidden_states=True` (which the caller never reads) gave **no measurable speedup** — the cost is the 15× small-kernel launches, not Python bookkeeping.
-- **CUDA graphs — the one lever that would attack launch latency — is blocked by HF `generate()`.** Both graph modes fail with `accessing tensor output of CUDAGraphs that has been overwritten by a subsequent run`: HF's generation loop holds references to step outputs that collide with CUDA-graph buffer reuse.
-- **So the real win requires replacing HF `generate()` with a custom static-shape decode loop** that can be CUDA-graph-captured by hand (re-implementing the per-step heads/embeddings + top-p/k/temperature sampling, then re-validating audio). That's a larger change with correctness/sampling-parity risk — scoped as the concrete next step, *not* a hand-wave.
+- **`torch.compile` CUDA-graph modes (`reduce-overhead`/`max-autotune`) fail under HF `generate()`** with `accessing tensor output of CUDAGraphs that has been overwritten by a subsequent run`: HF's generation loop holds references to step outputs that collide with CUDA-graph buffer reuse.
+
+**So we wrote the custom loop** (`fast_cp.py`, `FAST_CP_LOOP=1`) — mirroring the library's per-step heads / input-embeddings / projection / KV cache, minus HF's generation machinery — and validated it:
+
+| | Result |
+|---|---|
+| **Correctness** | **Exact greedy-token parity, 5/5 trials** vs the library path (`validate_cp.py`) — same tokens bit-for-bit |
+| **Speed** | **RTF 0.662 → 0.568 (~14% faster)** — purely from removing per-step generate overhead (cp GPU time unchanged at ~2.3 ms/call) |
+| **Audio** | clean (`sample_fastloop.wav`); greedy parity + HF-matched sampling warpers |
+
+- **CUDA graphs on top — still wall-blocked.** Even with our own loop, a **persistent `StaticCache`** (stable tensor addresses) and **cloned hidden reads**, `reduce-overhead` fails *identically* — the error is raised inside HF's `can_return_tuple` output wrapper (`transformers/utils/generic.py:918`): the KV cache crossing separately-graphed step calls trips inductor's cudagraph-tree guard. Closing this needs **manual graph capture that bypasses the HF `ModelOutput` wrapper** — the scoped next step. The ~14% custom-loop win is real and parity-validated; the launch-latency win behind the graph wall is not yet unlocked.
 
 ### End-to-end over the network (remote TTS service, box → local via WS + SSH tunnel)
 | Metric | Value |
@@ -123,7 +132,7 @@ The user-perceived turn latency is the sum of several legs, most of which are **
 **The finding that matters:** measured from India, the **cloud STT + LLM legs (~1.7 s combined) dominate everything** — they're ~3× the megakernel TTS leg (~0.55 s) and ~1000× the talker megakernel's ~1 ms/frame. **So the megakernel/TTS is not the end-to-end bottleneck; the cloud round-trips and geography are.** This is exactly why on-GPU TTFC/RTF (pure compute) and user-perceived latency (network-dominated) are *different problems*: a **US-co-located deployment** (box + STT/LLM regions near the user) would cut the ~1.7 s cloud legs hard, while leaving the on-GPU TTFC/RTF unchanged — those only move with kernel/compute work on the code predictor.
 
 ### Versus the targets (reference benchmarks, not pass/fail)
-- **RTF < 0.15** → we're at **0.60** (non-streaming) / ~0.82 (streaming). Honest reason: the code predictor's **15 sequential forward passes per frame** are the floor; the megakernel talker itself is ~1 ms/frame. We **measured** the obvious accelerations (see "Pushing on the code-predictor bottleneck" above): dropping unused work gave nothing, and `torch.compile` CUDA-graph modes are **blocked by HF `generate()`** — closing the gap further needs a custom CUDA-graph-able decode loop (scoped next step).
+- **RTF < 0.15** → we're at **~0.57–0.60** (non-streaming; **0.568 with the parity-validated custom code-predictor loop**, see "Pushing on the code-predictor bottleneck" above). The floor is the code predictor's **15 sequential forward passes per frame** (megakernel talker is ~1 ms/frame). We removed HF's generate overhead for a real ~14% win; the remaining launch-latency win is blocked from CUDA-graph capture by HF's output wrapper — closing it needs manual graph capture (scoped next step).
 - **TTFC < 60 ms** → we're at ~266 ms (local) / ~550 ms (remote). Dominated by prefill + the first frame's code predictor + vocode, plus the Vietnam network hop. The talker megakernel contributes ~1 ms.
 
 ---
@@ -199,5 +208,7 @@ cp .env.example .env                              # add DEEPGRAM_API_KEY + ANTHR
 | `pipecat_app.py` | Local Pipecat voice agent (mic → STT → LLM → remote TTS → speakers) |
 | `decompose.py` | Latency decomposition profiler (talker / code-predictor / vocoder) |
 | `bench_cp.py` + `run_bench.sh` | RTF + stage-breakdown sweep of code-predictor optimizations |
+| `fast_cp.py` | Custom code-predictor decode loop (drop-in for HF `generate`), `FAST_CP_LOOP=1` |
+| `validate_cp.py` | Greedy-token parity gate: custom loop vs library path (5/5 exact) |
 | `measure_legs.py` | Measure the cloud STT (Deepgram) + LLM (Anthropic) legs from the real network path |
 | `qwen_megakernel/csrc/kernel.cu` | Patched kernel (vocab override + barrier-race fix) |
