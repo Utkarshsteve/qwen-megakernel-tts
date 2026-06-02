@@ -69,6 +69,9 @@ def load_mk_tts(model="Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice",
         tk.code_predictor.model = torch.compile(tk.code_predictor.model, **ckw)
     if os.environ.get("FAST_CP") == "1":
         _install_fast_code_predictor(tk)
+    if os.environ.get("FAST_CP_LOOP") == "1":
+        from fast_cp import install_fast_cp_loop
+        install_fast_cp_loop(tk)
     if use_megakernel:
         ext = build_talker_extension(verbose=False)
         dec = TalkerDecoder(load_talker_weights(tts.model), ext)
