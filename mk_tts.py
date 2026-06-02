@@ -7,10 +7,26 @@ The megakernel replaces ONLY the talker backbone (tk.model):
     (row-0 embed trick). HF's cache_position advances on its own, so we don't
     need to grow the HF cache (the kernel keeps its own).
 """
+import os, functools
 import torch
 from transformers.modeling_outputs import BaseModelOutputWithPast
 from qwen_tts import Qwen3TTSModel
 from talker_megakernel import build_talker_extension, load_talker_weights, TalkerDecoder
+
+
+def _install_fast_code_predictor(tk):
+    """Per frame the talker calls code_predictor.generate(..., output_hidden_states=True),
+    but the caller only consumes predictor_result.sequences — the per-layer hidden-state
+    collection is pure overhead on this overhead-bound 5-layer model. Drop it."""
+    cp = tk.code_predictor
+    orig = cp.generate
+
+    @functools.wraps(orig)
+    def gen(*a, **k):
+        k["output_hidden_states"] = False
+        return orig(*a, **k)
+
+    cp.generate = gen
 
 
 def _install_megakernel_talker(tk, dec):
@@ -43,7 +59,16 @@ def load_mk_tts(model="Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice",
     if compile_code_predictor:
         # dynamic=True: compile ONCE for variable sequence lengths so we don't pay
         # a recompile on the first few (differently-sized) real utterances.
-        tk.code_predictor.model = torch.compile(tk.code_predictor.model, dynamic=True)
+        # COMPILE_MODE/COMPILE_DYNAMIC let us A/B torch.compile modes (e.g.
+        # reduce-overhead = CUDA graphs) without code edits.
+        mode = os.environ.get("COMPILE_MODE", "")
+        dynamic = os.environ.get("COMPILE_DYNAMIC", "1") == "1"
+        ckw = {"dynamic": dynamic}
+        if mode and mode != "none":
+            ckw["mode"] = mode
+        tk.code_predictor.model = torch.compile(tk.code_predictor.model, **ckw)
+    if os.environ.get("FAST_CP") == "1":
+        _install_fast_code_predictor(tk)
     if use_megakernel:
         ext = build_talker_extension(verbose=False)
         dec = TalkerDecoder(load_talker_weights(tts.model), ext)
