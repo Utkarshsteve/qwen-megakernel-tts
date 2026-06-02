@@ -7,7 +7,7 @@ This is an **integration** project. The headline results:
 - ✅ The megakernel runs the **Qwen3-TTS-12Hz-0.6B talker** (audio codebook group-0 decode) — numerically validated, audio confirmed clean.
 - ✅ Found and **fixed a real bug in the megakernel** (a grid-barrier reset race that deadlocks when the kernel is interleaved with other GPU work).
 - ✅ End-to-end **streaming** (frame-by-frame, not buffered) into a working **Pipecat** voice agent over a WebSocket TTS service.
-- ✅ **RTF 2.0 → 0.60** (3.3× faster, realtime-capable).
+- ✅ **RTF 2.0 → 0.568** (3.5× faster, realtime-capable) — megakernel talker + a parity-validated custom code-predictor decode loop.
 
 ---
 
@@ -104,7 +104,9 @@ The code predictor is ~65% of decode: **15 sequential forwards/frame of a tiny 5
 |---|---|
 | **Correctness** | **Exact greedy-token parity, 5/5 trials** vs the library path (`validate_cp.py`) — same tokens bit-for-bit |
 | **Speed** | **RTF 0.662 → 0.568 (~14% faster)** — purely from removing per-step generate overhead (cp GPU time unchanged at ~2.3 ms/call) |
-| **Audio** | clean (`sample_fastloop.wav`); greedy parity + HF-matched sampling warpers |
+| **Audio** | clean — **confirmed by listening** (`sample_fastloop.wav`); greedy parity + HF-matched sampling warpers |
+
+Validated and audio-confirmed, so the custom loop is **the default** (set `FAST_CP_LOOP=0` to fall back to HF `generate()`).
 
 - **CUDA graphs on top — still wall-blocked.** Even with our own loop, a **persistent `StaticCache`** (stable tensor addresses) and **cloned hidden reads**, `reduce-overhead` fails *identically* — the error is raised inside HF's `can_return_tuple` output wrapper (`transformers/utils/generic.py:918`): the KV cache crossing separately-graphed step calls trips inductor's cudagraph-tree guard. Closing this needs **manual graph capture that bypasses the HF `ModelOutput` wrapper** — the scoped next step. The ~14% custom-loop win is real and parity-validated; the launch-latency win behind the graph wall is not yet unlocked.
 
@@ -132,7 +134,7 @@ The user-perceived turn latency is the sum of several legs, most of which are **
 **The finding that matters:** measured from India, the **cloud STT + LLM legs (~1.7 s combined) dominate everything** — they're ~3× the megakernel TTS leg (~0.55 s) and ~1000× the talker megakernel's ~1 ms/frame. **So the megakernel/TTS is not the end-to-end bottleneck; the cloud round-trips and geography are.** This is exactly why on-GPU TTFC/RTF (pure compute) and user-perceived latency (network-dominated) are *different problems*: a **US-co-located deployment** (box + STT/LLM regions near the user) would cut the ~1.7 s cloud legs hard, while leaving the on-GPU TTFC/RTF unchanged — those only move with kernel/compute work on the code predictor.
 
 ### Versus the targets (reference benchmarks, not pass/fail)
-- **RTF < 0.15** → we're at **~0.57–0.60** (non-streaming; **0.568 with the parity-validated custom code-predictor loop**, see "Pushing on the code-predictor bottleneck" above). The floor is the code predictor's **15 sequential forward passes per frame** (megakernel talker is ~1 ms/frame). We removed HF's generate overhead for a real ~14% win; the remaining launch-latency win is blocked from CUDA-graph capture by HF's output wrapper — closing it needs manual graph capture (scoped next step).
+- **RTF < 0.15** → we're at **0.568** (non-streaming, with the parity-validated custom code-predictor loop that is now the default; see "Pushing on the code-predictor bottleneck" above). The floor is the code predictor's **15 sequential forward passes per frame** (megakernel talker is ~1 ms/frame). We removed HF's generate overhead for a real ~14% win; the remaining launch-latency win is blocked from CUDA-graph capture by HF's output wrapper — closing it needs manual graph capture (scoped next step).
 - **TTFC < 60 ms** → we're at ~266 ms (local) / ~550 ms (remote). Dominated by prefill + the first frame's code predictor + vocode, plus the Vietnam network hop. The talker megakernel contributes ~1 ms.
 
 ---

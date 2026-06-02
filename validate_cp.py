@@ -3,6 +3,8 @@ checking EXACT greedy-token parity against the library's HF generate path, on
 fixed random inputs. Greedy = deterministic argmax, so a correct loop must match
 the library bit-for-bit.
 """
+import os
+os.environ["FAST_CP_LOOP"] = "0"  # keep the genuine library generate as the parity baseline
 import torch
 from mk_tts import load_mk_tts
 from fast_cp import custom_generate
