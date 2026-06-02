@@ -83,6 +83,8 @@ Measured on a single RTX 5090 (Vast.ai), CUDA 13.1 / PyTorch 2.10 (NGC). Methodo
 | 2 | **266 ms** | 0.98 |
 | 4 | 387 ms | 0.82 |
 
+**Re-verified with the custom loop as default** (streaming server path, `test_tts_client.py`, chunk_frames=4): TTFC **~360 ms** (slightly better) and RTF **~0.84** — streaming RTF is **vocoder-gated** (the O(n²) re-vocode), so it's unchanged; the loop's win lands in *non-streaming* RTF (0.568), not here.
+
 ### Pushing on the code-predictor bottleneck — what we tried, and what actually happened (measured)
 
 The code predictor is ~65% of decode: **15 sequential forwards/frame of a tiny 5-layer model at ~2.3 ms/call**, dominated by small-kernel **launch latency**, not FLOPs. We A/B-tested the obvious accelerations with `bench_cp.py` (`run_bench.sh` sweeps them in fresh processes):
@@ -145,6 +147,7 @@ The user-perceived turn latency is the sum of several legs, most of which are **
 - Megakernel runs the real Qwen3-TTS talker; audio is clean and intelligible (bf16/fast-math drift is perceptually fine — TTS sampling absorbs it).
 - Live multi-turn voice conversation: STT → Anthropic → megakernel TTS → speakers, streamed frame-by-frame.
 - The barrier fix makes the kernel robust under interleaving.
+- The demo recording (`results/demo.mkv`) predates the custom-loop default — it's **functional proof** of the live mic→STT→LLM→TTS pipeline; all perf numbers come from the documented benchmarks/server logs (the streaming server was separately re-verified with the loop default — see Streaming above).
 
 **Rough / honest caveats**
 - **Acoustic echo:** with open speakers the bot hears itself and self-interrupts — **use headphones** (or add echo cancellation).
