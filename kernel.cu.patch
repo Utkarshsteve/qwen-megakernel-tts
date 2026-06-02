@@ -1,0 +1,83 @@
+diff --git a/csrc/kernel.cu b/csrc/kernel.cu
+index 217765b..8d782ab 100644
+--- a/csrc/kernel.cu
++++ b/csrc/kernel.cu
+@@ -70,8 +70,13 @@ constexpr int KV_SIZE = NUM_KV_HEADS * HEAD_DIM; // 1024
+ constexpr int LDG_NUM_WARPS = LDG_BLOCK_SIZE / WARP_SIZE;
+ constexpr float LDG_RMS_EPS = 1e-6f;
+ 
+-// LM head
++// LM head. Overridable at build time via -DLDG_VOCAB_SIZE_OVERRIDE=<n>
++// (e.g. 3072 for the Qwen3-TTS talker audio codebook head).
++#ifdef LDG_VOCAB_SIZE_OVERRIDE
++constexpr int LDG_VOCAB_SIZE = LDG_VOCAB_SIZE_OVERRIDE;
++#else
+ constexpr int LDG_VOCAB_SIZE = 151936;
++#endif
+ 
+ struct LDGLayerWeights {
+   const __nv_bfloat16 *input_layernorm_weight;
+@@ -1211,14 +1216,8 @@ __launch_bounds__(LDG_BLOCK_SIZE, 1) ldg_decode_kernel_persistent(
+   int block_id = blockIdx.x;
+   int num_blocks = gridDim.x;
+ 
+-  // Reset barrier counters + flags on-device
+-  if (block_id == 0 && threadIdx.x == 0) {
+-    *barrier_counter = 0;
+-    *barrier_sense = 0;
+-    atomicExch(kv_flag, 0u);
+-    atomicExch(attn_flag, 0u);
+-  }
+-  __syncthreads();
++  // Barrier/flag buffers are zeroed host-side (stream-ordered) before launch; the
++  // on-device reset was removed (it raced with other blocks' first atomicAdd).
+   if (threadIdx.x == 0) {
+     asm volatile("fence.acq_rel.gpu;" ::: "memory");
+     unsigned int arrived = atomicAdd(barrier_counter, 1);
+@@ -1330,13 +1329,11 @@ __global__ void __launch_bounds__(LDG_BLOCK_SIZE, 1) ldg_decode_kernel_direct(
+   int block_id = blockIdx.x;
+   int num_blocks = gridDim.x;
+ 
+-  if (block_id == 0 && threadIdx.x == 0) {
+-    *barrier_counter = 0;
+-    *barrier_sense = 0;
+-    atomicExch(kv_flag, 0u);
+-    atomicExch(attn_flag, 0u);
+-  }
+-  __syncthreads();
++  // Barrier/flag buffers are zeroed host-side (stream-ordered) before launch; no
++  // on-device reset here -- it raced with other blocks' first atomicAdd (a block
++  // could increment before block 0's reset landed, so the counter never reached
++  // num_blocks -> grid-barrier deadlock). Surfaced only when interleaved with
++  // other kernels (the Qwen3-TTS code predictor), which shifted block timing.
+   if (threadIdx.x == 0) {
+     asm volatile("fence.acq_rel.gpu;" ::: "memory");
+     unsigned int arrived = atomicAdd(barrier_counter, 1);
+@@ -1486,6 +1483,13 @@ extern "C" void launch_ldg_decode_direct(
+   ldg_configure_kernel_attributes();
+   ensure_barrier_alloc();
+ 
++  // Zero the grid-barrier + flag buffers, stream-ordered, before the kernel so
++  // every block sees them at 0 (replaces the racy on-device reset).
++  cudaMemsetAsync(d_barrier_counter, 0, sizeof(unsigned int), stream);
++  cudaMemsetAsync(d_barrier_sense, 0, sizeof(unsigned int), stream);
++  cudaMemsetAsync(d_kv_flag, 0, sizeof(unsigned int), stream);
++  cudaMemsetAsync(d_attn_flag, 0, sizeof(unsigned int), stream);
++
+   ldg_decode_kernel_direct<<<LDG_NUM_BLOCKS, LDG_BLOCK_SIZE, 0, stream>>>(
+       (const __nv_bfloat16 *)embed_weight, layer_weights,
+       (const __nv_bfloat16 *)final_norm_weight,
+@@ -1524,6 +1528,13 @@ extern "C" void launch_ldg_decode_persistent(
+   cudaMemcpyAsync(d_mutable_token_id, h_pinned_token_id, sizeof(int),
+                   cudaMemcpyHostToDevice, stream);
+ 
++  // Zero the grid-barrier + flag buffers, stream-ordered, before the kernel
++  // (replaces the racy on-device reset).
++  cudaMemsetAsync(d_barrier_counter, 0, sizeof(unsigned int), stream);
++  cudaMemsetAsync(d_barrier_sense, 0, sizeof(unsigned int), stream);
++  cudaMemsetAsync(d_kv_flag, 0, sizeof(unsigned int), stream);
++  cudaMemsetAsync(d_attn_flag, 0, sizeof(unsigned int), stream);
++
+   ldg_decode_kernel_persistent<<<LDG_NUM_BLOCKS, LDG_BLOCK_SIZE, 0, stream>>>(
+       (const __nv_bfloat16 *)embed_weight, layer_weights,
+       (const __nv_bfloat16 *)final_norm_weight,
