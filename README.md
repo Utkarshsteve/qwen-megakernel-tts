@@ -93,17 +93,18 @@ Measured on a single RTX 5090 (Vast.ai), CUDA 13.1 / PyTorch 2.10 (NGC). Methodo
 
 ### End-to-end conversational latency (you stop talking → you hear the reply)
 
-Because STT and the LLM are **cloud services**, the user-perceived turn latency is dominated by hops we don't own — so we **decompose** it rather than report a single misleading number. Only the **TTS leg is our measurement**; the STT/LLM legs are typical published/observed ranges for the providers used (Deepgram streaming, Anthropic `claude-haiku-4-5`) and were **not instrumented with hard timers** in the live run — they are labeled accordingly.
+The user-perceived turn latency is the sum of several legs, most of which are **cloud round-trips we don't own**. We measured each leg from the **same machine and network path the live demo used** (client in India → cloud), via `measure_legs.py`. All numbers below are **measured**, not estimated.
 
-| Leg | Latency | Source |
+| Leg | Latency (median) | How measured |
 |---|---|---|
-| VAD endpointing (Silero, silence → "turn over") | ~200 ms | config (`stop_secs`) |
-| Deepgram STT final transcript (after speech end) | ~100–300 ms | *typical, cloud, not measured here* |
-| Anthropic first token (Haiku) | ~200–500 ms | *typical, cloud, not measured here* |
-| **TTS TTFC (megakernel, client-side incl. network)** | **~550–610 ms** | **measured (this repo)** |
-| **≈ first audio after you stop talking** | **~1.05–1.6 s** | sum (estimate) |
+| VAD end-of-turn detection (Silero, pipecat default) | adds an endpoint-silence wait | config, not timed here |
+| **Deepgram STT** — `Finalize`-flush, this India→cloud path | **~770 ms** (690–971, n=4) | `measure_legs.py` |
+| **Anthropic LLM** — TTFT, `claude-haiku-4-5`, this path | **~895 ms** (816–1545, n=6) | `measure_legs.py` |
+| **Megakernel TTS** — TTFC, client-side incl. network | **~550–610 ms** | server logs + client |
 
-**Reading this honestly:** the megakernel TTS leg (~550 ms client / ~415 ms on-GPU) is the single largest *controllable* component, and within it the **code predictor — not the talker — is the floor** (see decomposition above). The cloud STT/LLM legs and the India↔Vietnam network are real contributors to perceived latency but are outside the scope of the kernel work. A US box (closer to the user and to the STT/LLM regions) would cut the network and likely the cloud legs; it would **not** change the on-GPU TTFC/RTF, which are pure compute.
+**Two honest caveats on summing these:** (1) the legs **partially overlap** in the live pipeline — Deepgram transcribes *while* you speak, so its real added latency after speech-end is less than a cold `Finalize`-flush; treat the STT number as an upper bound. (2) Therefore the naïve sum (~2.2 s) is an **upper-bound decomposition**, not the exact perceived gap.
+
+**The finding that matters:** measured from India, the **cloud STT + LLM legs (~1.7 s combined) dominate everything** — they're ~3× the megakernel TTS leg (~0.55 s) and ~1000× the talker megakernel's ~1 ms/frame. **So the megakernel/TTS is not the end-to-end bottleneck; the cloud round-trips and geography are.** This is exactly why on-GPU TTFC/RTF (pure compute) and user-perceived latency (network-dominated) are *different problems*: a **US-co-located deployment** (box + STT/LLM regions near the user) would cut the ~1.7 s cloud legs hard, while leaving the on-GPU TTFC/RTF unchanged — those only move with kernel/compute work on the code predictor.
 
 ### Versus the targets (reference benchmarks, not pass/fail)
 - **RTF < 0.15** → we're at **0.60** (non-streaming) / ~0.82 (streaming). Honest reason: the code predictor's **15 sequential MTP forward passes per frame** are an inherent floor; the megakernel talker itself is ~1 ms/frame. Further `torch.compile reduce-overhead`/CUDA-graphs on the code predictor would close more of the gap (left as documented future work — it's finicky with the growing MTP KV cache).
