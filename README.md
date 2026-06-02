@@ -58,7 +58,7 @@ Measured on a single RTX 5090 (Vast.ai), CUDA 13.1 / PyTorch 2.10 (NGC). Methodo
 | Megakernel (Qwen3-0.6B, our box) | **1020.8** | 0.98 |
 | (blog reference) | 1036 | 0.97 |
 
-### The bottleneck — honest latency decomposition (stock 0.6B TTS, 10.2 s audio, RTF 2.03)
+### The bottleneck — latency decomposition (stock 0.6B TTS, 10.2 s audio, RTF 2.03)
 | Stage | Time | Share |
 |---|---|---|
 | **Talker backbone** (what the megakernel replaces) | 5.4 s | **26%** |
@@ -96,7 +96,7 @@ The code predictor is ~65% of decode: **15 sequential forwards/frame of a tiny 5
 | `torch.compile(mode="reduce-overhead")` (CUDA graphs) | — | — | ❌ **fails** |
 | `torch.compile(mode="max-autotune")` | — | — | ❌ **fails** |
 
-**Findings (honest):**
+**Findings:**
 - Dropping the per-frame `output_hidden_states=True` (which the caller never reads) gave **no measurable speedup** — the cost is the 15× small-kernel launches, not Python bookkeeping.
 - **`torch.compile` CUDA-graph modes (`reduce-overhead`/`max-autotune`) fail under HF `generate()`** with `accessing tensor output of CUDAGraphs that has been overwritten by a subsequent run`: HF's generation loop holds references to step outputs that collide with CUDA-graph buffer reuse.
 
@@ -131,7 +131,7 @@ The user-perceived turn latency is the sum of several legs, most of which are **
 | **Anthropic LLM** — TTFT, `claude-haiku-4-5`, this path | **~895 ms** (816–1545, n=6) | `measure_legs.py` |
 | **Megakernel TTS** — TTFC, client-side incl. network | **~550–610 ms** | server logs + client |
 
-**Two honest caveats on summing these:** (1) the legs **partially overlap** in the live pipeline — Deepgram transcribes *while* you speak, so its real added latency after speech-end is less than a cold `Finalize`-flush; treat the STT number as an upper bound. (2) Therefore the naïve sum (~2.2 s) is an **upper-bound decomposition**, not the exact perceived gap.
+**Two caveats on summing these:** (1) the legs **partially overlap** in the live pipeline — Deepgram transcribes *while* you speak, so its real added latency after speech-end is less than a cold `Finalize`-flush; treat the STT number as an upper bound. (2) Therefore the naïve sum (~2.2 s) is an **upper-bound decomposition**, not the exact perceived gap.
 
 **The finding that matters:** measured from India, the **cloud STT + LLM legs (~1.7 s combined) dominate everything** — they're ~3× the megakernel TTS leg (~0.55 s) and ~1000× the talker megakernel's ~1 ms/frame. **So the megakernel/TTS is not the end-to-end bottleneck; the cloud round-trips and geography are.** This is exactly why on-GPU TTFC/RTF (pure compute) and user-perceived latency (network-dominated) are *different problems*: a **US-co-located deployment** (box + STT/LLM regions near the user) would cut the ~1.7 s cloud legs hard, while leaving the on-GPU TTFC/RTF unchanged — those only move with kernel/compute work on the code predictor.
 
@@ -149,7 +149,7 @@ The user-perceived turn latency is the sum of several legs, most of which are **
 - The barrier fix makes the kernel robust under interleaving.
 - The demo recording (`results/demo.mkv`) predates the custom-loop default — it's **functional proof** of the live mic→STT→LLM→TTS pipeline; all perf numbers come from the documented benchmarks/server logs (the streaming server was separately re-verified with the loop default — see Streaming above).
 
-**Rough / honest caveats**
+**Rough edges**
 - **Acoustic echo:** with open speakers the bot hears itself and self-interrupts — **use headphones** (or add echo cancellation).
 - **RTF/TTFC above the aggressive reference targets** — because the code predictor (not the talker) dominates, and the GPU was remote (Vietnam) for this run.
 - **Streaming vocoder is cumulative re-decode (O(n²))** — fine for short replies; an overlap-window variant would make it O(n).
