@@ -130,10 +130,17 @@ Because STT and the LLM are **cloud services**, the user-perceived turn latency 
 
 ### 1. On the RTX 5090 box
 ```bash
-# CUDA 12.8+ / sm_120. Clone the (patched) megakernel + Qwen3-TTS, install deps.
-git clone https://github.com/AlpinDale/qwen_megakernel   # apply kernel.cu patch (this repo)
+# CUDA 12.8+ / sm_120. Run this from inside a clone of THIS repo (so kernel.cu.patch
+# sits alongside the clones below). Clone the megakernel + Qwen3-TTS, install deps.
+git clone https://github.com/AlpinDale/qwen_megakernel
 git clone https://github.com/QwenLM/Qwen3-TTS && pip install -e Qwen3-TTS --no-deps
 pip install "transformers==4.57.3" accelerate websockets
+
+# Apply the kernel fix (vocab override + grid-barrier reset race). The patch targets
+# csrc/kernel.cu, so apply it from the megakernel repo root:
+git -C qwen_megakernel apply ../kernel.cu.patch        # ../ = this repo's checkout
+git -C qwen_megakernel diff --stat                     # sanity-check: csrc/kernel.cu changed
+
 # copy this repo's *.py next to the clones, then:
 HF_HOME=./hf python tts_server.py        # builds talker kernel, warms up, serves :8765
 ```
